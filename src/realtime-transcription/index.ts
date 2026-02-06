@@ -4,6 +4,9 @@ export { RealtimeTranscriber } from './RealtimeTranscriber'
 // Slice manager (for advanced use cases)
 export { SliceManager } from './SliceManager'
 
+// Ring buffer for pre-recording audio
+export { RingBuffer } from './RingBuffer'
+
 export type { WavFileWriterFs } from '../utils/WavFileWriter'
 
 // Types and interfaces
@@ -27,7 +30,6 @@ export type {
   AudioSlice,
   AudioSliceNoData,
   MemoryUsage,
-
 } from './types'
 
 // VAD presets constant

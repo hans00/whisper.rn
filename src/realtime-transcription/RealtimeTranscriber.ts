@@ -1,6 +1,7 @@
 /* eslint-disable class-methods-use-this */
 import type { VadOptions } from '../index'
 import { SliceManager } from './SliceManager'
+import { RingBuffer } from './RingBuffer'
 import { WavFileWriter, WavFileWriterFs } from '../utils/WavFileWriter'
 import type {
   RealtimeOptions,
@@ -60,6 +61,12 @@ export class RealtimeTranscriber {
     // VAD optimization options for low-end CPU
     vadThrottleMs: number // Minimum time between VAD calls (ms)
     vadSkipRatio: number // Skip every Nth slice (0 = no skipping)
+    // Realtime transcription settings
+    realtimeProcessingPauseSec: number
+    initRealtimeAfterSec: number
+    // VAD Performance Optimization
+    preRecordingBufferSec: number
+    energyThreshold: number
   }
 
   private isActive = false
@@ -68,12 +75,15 @@ export class RealtimeTranscriber {
 
   private vadEnabled = false
 
+  private isSpeechActive = false
+
   private transcriptionQueue: Array<{
     sliceIndex: number
     audioData: Uint8Array
+    isFinal?: boolean
   }> = []
 
-  private accumulatedData: Uint8Array = new Uint8Array(0)
+
 
   private wavFileWriter: WavFileWriter | null = null
 
@@ -81,19 +91,13 @@ export class RealtimeTranscriber {
   private lastSpeechDetectedTime = 0
 
   // Track VAD state for proper event transitions
-  private lastVadState: 'speech' | 'silence' = 'silence'
+
 
   // Track last stats to emit only when changed
   private lastStatsSnapshot: any = null
 
-  // VAD throttling for low-end CPU optimization
-  private isProcessingVAD = false
-
-  private lastVadProcessTime = 0
-
-  private vadProcessingQueue: any[] = []
-
-  private skippedVadCount = 0
+  // State management for silence duration
+  private silenceStartTime = 0
 
   // Store transcription results by slice index
   private transcriptionResults: Map<
@@ -103,6 +107,9 @@ export class RealtimeTranscriber {
 
   // Store VAD events by slice index for inclusion in transcribe events
   private vadEvents: Map<number, RealtimeVadEvent> = new Map()
+
+  // Ring buffer for pre-recording audio
+  private preRecordingBuffer: RingBuffer
 
   constructor(
     dependencies: RealtimeTranscriberDependencies,
@@ -128,11 +135,21 @@ export class RealtimeTranscriber {
       initialPrompt: options.initialPrompt,
       promptPreviousSlices: options.promptPreviousSlices ?? true,
       audioOutputPath: options.audioOutputPath,
-      logger: options.logger || (() => {}),
+      logger: options.logger || (() => { }),
       // VAD optimization options for low-end CPU
       vadThrottleMs: options.vadThrottleMs ?? 1500, // Minimum time between VAD calls (ms)
       vadSkipRatio: options.vadSkipRatio ?? 0, // Skip every Nth slice (0 = no skipping)
+      // Realtime transcription settings
+      realtimeProcessingPauseSec: options.realtimeProcessingPauseSec ?? 0.2,
+      initRealtimeAfterSec: options.initRealtimeAfterSec ?? 0.2,
+      // VAD Performance Optimization
+      preRecordingBufferSec: options.preRecordingBufferSec ?? 1.0,
+      energyThreshold: options.energyThreshold ?? 0,
     }
+
+    // Initialize RingBuffer
+    const bufferSize = Math.floor(this.options.preRecordingBufferSec * 16000 * 2) // 16kHz, 16-bit
+    this.preRecordingBuffer = new RingBuffer(bufferSize)
 
     // Apply VAD preset if specified
     if (this.options.vadPreset && VAD_PRESETS[this.options.vadPreset]) {
@@ -221,11 +238,6 @@ export class RealtimeTranscriber {
       // Stop audio recording
       await this.audioStream.stop()
 
-      // Process any remaining accumulated data
-      if (this.accumulatedData.length > 0) {
-        this.processAccumulatedDataForSliceManagement()
-      }
-
       // Process any remaining queued transcriptions
       await this.processTranscriptionQueue()
 
@@ -250,521 +262,255 @@ export class RealtimeTranscriber {
   }
 
   /**
-   * Handle incoming audio data from audio stream
+   * Handle incoming audio data
    */
   private handleAudioData(streamData: AudioStreamData): void {
-    if (!this.isActive) {
-      return
-    }
+    if (!this.isActive) return
 
-    try {
-      // Write to WAV file if enabled (convert to Uint8Array for WavFileWriter)
-      if (this.wavFileWriter) {
-        this.wavFileWriter.appendAudioData(streamData.data).catch((error) => {
-          this.log(`Failed to write audio to WAV file: ${error}`)
-        })
-      }
+    this.processAudioChunk(streamData.data).catch((error) => {
+      this.handleError(`Audio processing error: ${error}`)
+    })
 
-      // Always accumulate data for slice management
-      this.accumulateAudioData(streamData.data)
-    } catch (error) {
-      const errorMessage =
-        error instanceof Error ? error.message : 'Audio processing error'
-      this.handleError(errorMessage)
+    // Write to WAV file if enabled
+    if (this.wavFileWriter) {
+      this.wavFileWriter.appendAudioData(streamData.data).catch((error) => {
+        this.log(`Failed to write audio to WAV file: ${error}`)
+      })
     }
   }
 
   /**
-   * Accumulate audio data for slice management
+   * Process audio chunk through the VAD pipeline
    */
-  private accumulateAudioData(newData: Uint8Array): void {
-    const combined = new Uint8Array(
-      this.accumulatedData.length + newData.length,
-    )
-    combined.set(this.accumulatedData)
-    combined.set(new Uint8Array(newData), this.accumulatedData.length)
-    this.accumulatedData = combined
+  private async processAudioChunk(data: Uint8Array): Promise<void> {
+    // 1. Push to Ring Buffer
+    this.preRecordingBuffer.write(data)
 
-    // Process accumulated data when we have enough for slice management
-    const minBufferSamples = 16000 * 1 // 1 second for slice management
-    if (this.accumulatedData.length >= minBufferSamples) {
-      this.processAccumulatedDataForSliceManagement()
-    }
-  }
+    // 2. Pre-VAD Filter
+    if (this.callbacks.onBeginVad) {
+      const { sampleRate = 16000 } = this.options.audioStreamConfig || {}
+      const duration = (data.length / 2) / (sampleRate / 1000) // ms
 
-  /**
-   * Process accumulated audio data through SliceManager
-   */
-  private processAccumulatedDataForSliceManagement(): void {
-    if (this.accumulatedData.length === 0) {
-      return
-    }
-
-    // Process through slice manager directly with Uint8Array
-    const result = this.sliceManager.addAudioData(this.accumulatedData)
-
-    if (result.slice) {
-      this.log(
-        `Slice ${result.slice.index} ready (${result.slice.data.length} bytes)`,
-      )
-
-      // Process VAD for the slice if enabled (with throttling for low-end CPU)
-      if (!this.isTranscribing && this.vadEnabled) {
-        this.queueVADProcessing(result.slice)
-      } else if (!this.isTranscribing) {
-        // If VAD is disabled, transcribe slices as they become ready
-        this.queueSliceForTranscription(result.slice).catch((error: any) => {
-          this.handleError(`Failed to queue slice for transcription: ${error}`)
-        })
-      } else {
-        this.log(`Skipping slice ${result.slice.index} - already transcribing`)
-      }
-
-      this.emitStatsUpdate('memory_change')
-    }
-
-    // Clear accumulated data
-    this.accumulatedData = new Uint8Array(0)
-  }
-
-  /**
-   * Check if auto-slice should be triggered based on VAD event and timing
-   */
-  private async checkAutoSlice(
-    vadEvent: RealtimeVadEvent,
-    _slice: any,
-  ): Promise<void> {
-    if (!this.options.autoSliceOnSpeechEnd || !this.vadEnabled) {
-      return
-    }
-
-    // Only trigger on speech_end or silence events
-    const shouldTriggerAutoSlice =
-      vadEvent.type === 'speech_end' || vadEvent.type === 'silence'
-
-    if (!shouldTriggerAutoSlice) {
-      return
-    }
-
-    // Get current slice info from SliceManager
-    const currentSliceInfo = this.sliceManager.getCurrentSliceInfo()
-    const currentSlice = this.sliceManager.getSliceByIndex(
-      currentSliceInfo.currentSliceIndex,
-    )
-
-    if (!currentSlice) {
-      return
-    }
-
-    // Calculate current slice duration
-    const currentDuration = (Date.now() - currentSlice.startTime) / 1000 // Convert to seconds
-    const targetDuration = this.options.audioSliceSec
-    const minDuration = this.options.audioMinSec
-    const autoSliceThreshold = targetDuration * this.options.autoSliceThreshold
-
-    // Check if conditions are met for auto-slice
-    const meetsMinDuration = currentDuration >= minDuration
-    const meetsThreshold = currentDuration >= autoSliceThreshold
-
-    if (meetsMinDuration && meetsThreshold) {
-      this.log(
-        `Auto-slicing on ${vadEvent.type} at ${currentDuration.toFixed(1)}s ` +
-          `(min: ${minDuration}s, threshold: ${autoSliceThreshold.toFixed(
-            1,
-          )}s, target: ${targetDuration}s)`,
-      )
-
-      // Force next slice
-      await this.nextSlice()
-    } else {
-      this.log(
-        `Auto-slice conditions not met on ${vadEvent.type}: ` +
-          `duration=${currentDuration.toFixed(
-            1,
-          )}s, min=${minDuration}s, threshold=${autoSliceThreshold.toFixed(
-            1,
-          )}s ` +
-          `(minOk=${meetsMinDuration}, thresholdOk=${meetsThreshold})`,
-      )
-    }
-  }
-
-  /**
-   * Queue VAD processing with throttling for low-end CPU systems
-   * This prevents VAD from blocking the audio pipeline
-   */
-  private queueVADProcessing(slice: any): void {
-    // Check if we should skip this slice based on skip ratio
-    if (this.options.vadSkipRatio > 0) {
-      const shouldSkip = slice.index % (this.options.vadSkipRatio + 1) !== 0
-      if (shouldSkip) {
-        this.skippedVadCount += 1
-        this.log(
-          `Skipping VAD for slice ${slice.index} (skip ratio: ${this.options.vadSkipRatio})`,
-        )
-        // Still queue for transcription if VAD would have approved
-        this.queueSliceForTranscription(slice).catch((error: any) => {
-          this.handleError(`Failed to queue skipped slice for transcription: ${error}`)
-        })
-        return
-      }
-    }
-
-    // Check throttling - don't process if we recently processed VAD
-    const now = Date.now()
-    const timeSinceLastVad = now - this.lastVadProcessTime
-
-    if (this.isProcessingVAD) {
-      // VAD is already running, queue this slice
-      this.vadProcessingQueue.push(slice)
-      this.log(
-        `VAD busy, queued slice ${slice.index} (queue size: ${this.vadProcessingQueue.length})`,
-      )
-      return
-    }
-
-    if (timeSinceLastVad < this.options.vadThrottleMs) {
-      // Too soon since last VAD, queue it
-      this.vadProcessingQueue.push(slice)
-      this.log(
-        `VAD throttled, queued slice ${slice.index} (will process in ${
-          this.options.vadThrottleMs - timeSinceLastVad
-        }ms)`,
-      )
-      // Schedule processing after throttle period
-      setTimeout(() => {
-        this.processVADQueue()
-      }, this.options.vadThrottleMs - timeSinceLastVad)
-      return
-    }
-
-    this.processSliceVADThrottled(slice)
-  }
-
-  /**
-   * Process the VAD queue
-   */
-  private processVADQueue(): void {
-    if (this.isProcessingVAD || this.vadProcessingQueue.length === 0) {
-      return
-    }
-
-    // Get the most recent slice from queue (discard older ones for real-time performance)
-    const slice = this.vadProcessingQueue.pop()
-    this.vadProcessingQueue = [] // Clear queue, we only care about latest
-
-    if (slice) {
-      this.log(`Processing queued VAD for slice ${slice.index}`)
-      this.processSliceVADThrottled(slice)
-    }
-  }
-
-  /**
-   * Throttled wrapper for processSliceVAD
-   */
-  private async processSliceVADThrottled(slice: any): Promise<void> {
-    if (this.isProcessingVAD) {
-      // Already processing, re-queue
-      this.vadProcessingQueue.push(slice)
-      return
-    }
-
-    this.isProcessingVAD = true
-    this.lastVadProcessTime = Date.now()
-
-    try {
-      await this.processSliceVAD(slice)
-    } catch (error) {
-      this.handleError(`VAD processing error: ${error}`)
-    } finally {
-      this.isProcessingVAD = false
-
-      // Process next item in queue if available
-      if (this.vadProcessingQueue.length > 0) {
-        // Schedule next processing with a small delay to yield to event loop
-        setTimeout(() => {
-          this.processVADQueue()
-        }, 50) // 50ms delay between VAD processings
-      }
-    }
-  }
-
-  /**
-   * Process VAD for a completed slice
-   */
-  private async processSliceVAD(slice: any): Promise<void> {
-    try {
-      // Get audio data from the slice for VAD processing
-      const audioData = this.sliceManager.getAudioDataForTranscription(
-        slice.index,
-      )
-
-      if (!audioData) {
-        this.log(
-          `No audio data available for VAD processing of slice ${slice.index}`,
-        )
-        return
-      }
-
-      // Check if user callback allows VAD processing
-      if (this.callbacks.onBeginVad) {
-        const {
-          sampleRate = 16000,
-          channels = 1,
-        } = this.options.audioStreamConfig || {}
-        const duration = audioData.length / sampleRate / channels * 1000 // Convert to milliseconds
-        const shouldProcessVad =
-          (await this.callbacks.onBeginVad({
-            sliceIndex: slice.index,
-            audioData,
-            duration,
-          })) ?? true
-
-        if (!shouldProcessVad) {
-          this.log(`User callback declined VAD processing for slice ${slice.index}`)
-          return
-        }
-      }
-
-      // Detect speech in the slice
-      const vadEvent = await this.detectSpeech(audioData, slice.index)
-      vadEvent.timestamp = Date.now()
-
-      // Store VAD event for inclusion in transcribe event
-      this.vadEvents.set(slice.index, vadEvent)
-
-      // Emit VAD event
-      this.callbacks.onVad?.(vadEvent)
-
-      // Check if auto-slice should be triggered
-      await this.checkAutoSlice(vadEvent, slice)
-
-      // Check if speech was detected and if we should transcribe
-      const isSpeech =
-        vadEvent.type === 'speech_start' || vadEvent.type === 'speech_continue'
-
-      const isSpeechEnd = vadEvent.type === 'speech_end'
-
-      if (isSpeech) {
-        const minDuration = this.options.audioMinSec
-        // Check minimum duration requirement
-        const speechDuration = slice.data.length / 16000 / 2 // Convert bytes to seconds (16kHz, 16-bit)
-
-        if (speechDuration >= minDuration) {
-          this.log(
-            `Speech detected in slice ${slice.index}, queueing for transcription`,
-          )
-          await this.queueSliceForTranscription(slice)
-        } else {
-          this.log(
-            `Speech too short in slice ${slice.index} (${speechDuration.toFixed(
-              2,
-            )}s < ${minDuration}s), skipping`,
-          )
-        }
-      } else if (isSpeechEnd) {
-        this.log(`Speech ended in slice ${slice.index}`)
-        // For speech_end events, we might want to queue the slice for transcription
-        // to capture the final part of the speech segment
-        const speechDuration = slice.data.length / 16000 / 2 // Convert bytes to seconds
-        const minDuration = this.options.audioMinSec
-
-        if (speechDuration >= minDuration) {
-          this.log(
-            `Speech end detected in slice ${slice.index}, queueing final segment for transcription`,
-          )
-          await this.queueSliceForTranscription(slice)
-        } else {
-          this.log(
-            `Speech end segment too short in slice ${
-              slice.index
-            } (${speechDuration.toFixed(2)}s < ${minDuration}s), skipping`,
-          )
-        }
-      } else {
-        this.log(`No speech detected in slice ${slice.index}`)
-      }
-
-      // Emit stats update for VAD change
-      this.emitStatsUpdate('vad_change')
-    } catch (error: any) {
-      this.handleError(
-        `VAD processing error for slice ${slice.index}: ${error}`,
-      )
-    }
-  }
-
-  /**
-   * Queue a slice for transcription
-   */
-  private async queueSliceForTranscription(slice: any): Promise<void> {
-    try {
-      // Get audio data from the slice
-      const audioData = this.sliceManager.getAudioDataForTranscription(
-        slice.index,
-      )
-
-      if (!audioData) {
-        this.log(`No audio data available for slice ${slice.index}`)
-        return
-      }
-
-      if (this.callbacks.onBeginTranscribe) {
-        const shouldTranscribe =
-          (await this.callbacks.onBeginTranscribe({
-            sliceIndex: slice.index,
-            audioData,
-            duration: (slice.data.length / 16000 / 2) * 1000, // Convert to milliseconds
-            vadEvent: this.vadEvents.get(slice.index),
-          })) ?? true
-
-        if (!shouldTranscribe) {
-          this.log(
-            `User callback declined transcription for slice ${slice.index}`,
-          )
-          return
-        }
-      }
-
-      // Add to transcription queue
-      this.transcriptionQueue.unshift({
-        sliceIndex: slice.index,
-        audioData,
+      const shouldContinue = await this.callbacks.onBeginVad({
+        audioData: data,
+        sliceIndex: -1, // No slice index yet for raw chunks
+        duration,
       })
 
-      this.log(
-        `Queued slice ${slice.index} for transcription (${slice.data.length} samples)`,
-      )
+      if (!shouldContinue) {
+        // User cancelled VAD for this chunk
+        return
+      }
+    }
 
-      await this.processTranscriptionQueue()
-    } catch (error: any) {
-      this.handleError(`Failed to queue slice for transcription: ${error}`)
+    // 3. Fast Energy Estimate
+    if (this.options.energyThreshold > 0) {
+      const rms = this.calculateRMS(data)
+      if (rms < this.options.energyThreshold) {
+        // Silence, skip expensive VAD
+        await this.handleVADStateChange(0, data)
+        return
+      }
+    }
+
+    // 3. VAD from Ring Buffer (using 1.0s context)
+    let speechRate = 0
+    try {
+      if (this.vadContext) {
+        const vadInput = this.preRecordingBuffer.read()
+        if (vadInput.byteLength > 0) {
+          const vadInputBuffer = vadInput.buffer as ArrayBuffer
+          const segments = await this.vadContext.detectSpeechData(
+            vadInputBuffer,
+            this.options.vadOptions
+          )
+          // calc prob from t0 ~ t1 cover rate
+          const audioLength = vadInput.byteLength / 2 / (this.options.audioStreamConfig?.sampleRate || 16000)
+          // t0/t1 is 10ms unit
+          speechRate = segments.reduce((acc, { t0, t1 }) => acc + (t1 - t0) / 100, 0) / audioLength
+        }
+      } else {
+        // If VAD is disabled or unavailable, assume speech if active
+        speechRate = 1
+      }
+    } catch (error) {
+      this.log(`VAD error: ${error}`)
+    }
+
+    // 4. Switch VAD State
+    await this.handleVADStateChange(speechRate, data)
+  }
+
+  /**
+   * Calculate RMS energy of audio chunk
+   */
+  private calculateRMS(data: Uint8Array): number {
+    if (data.length === 0) return 0
+
+    // Convert to Int16 samples
+    const sampleCount = data.length / 2
+    let sumSquares = 0
+
+    // Process 2 bytes at a time (little endian)
+    for (let i = 0; i < data.length - 1; i += 2) {
+      const low = data[i] as number
+      const high = data[i + 1] as number
+      // eslint-disable-next-line no-bitwise
+      const sample = (high << 8) | low
+      // Check for sign (16-bit signed)
+      // eslint-disable-next-line no-bitwise
+      const signedSample = sample >= 0x8000 ? sample - 0x10000 : sample
+      // Normalize to -1.0 to 1.0 range
+      const normalized = signedSample / 32768.0
+      sumSquares += normalized ** 2
+    }
+
+    return Math.sqrt(sumSquares / sampleCount)
+  }
+
+  /**
+   * Handle state transitions based on VAD result
+   */
+  private async handleVADStateChange(speechRate: number, data: Uint8Array): Promise<void> {
+    const isRecording = this.isSpeechActive
+    const threshold = this.options.vadOptions?.threshold || 0.5
+
+    if (speechRate > threshold) {
+      this.silenceStartTime = 0 // Reset silence counter
+
+      if (!isRecording) {
+        // === START RECORDING ===
+        this.log('VAD: Speech Start detected')
+        this.isSpeechActive = true
+
+        // 5a. Create slice with RingBuffer (Pre-roll)
+        const preRoll = this.preRecordingBuffer.read()
+
+        // Reset SliceManager logic to start fresh?
+        // We assume addAudioData handles appending to "current" slice.
+        // We want to force a new logical segment if we were just 'listening'.
+        // But SliceManager wraps 30s slices. We just feed it.
+        // Important: preRoll contains [Old...New].
+        this.sliceManager.addAudioData(preRoll)
+
+        this.emitVadEvent('speech_start')
+      } else {
+        // === CONTINUE RECORDING ===
+        // 5b. Append raw data directly (not from RingBuffer)
+        this.sliceManager.addAudioData(data)
+
+        this.emitVadEvent('speech_continue')
+
+        // 6. Transcribe (Partial)
+        this.triggerTranscription(false)
+      }
+    } else {
+      // Silence detected
+      // eslint-disable-next-line no-lonely-if
+      if (isRecording) {
+        // Check for silence timeout (Hysteresis)
+        if (this.silenceStartTime === 0) {
+          this.silenceStartTime = Date.now()
+        }
+
+        const silenceDuration = (Date.now() - this.silenceStartTime) / 1000
+
+        // Resolve min silence duration from VAD options or presets
+        const vadSilenceMs = this.options.vadOptions.minSilenceDurationMs
+
+        // Use VAD setting if available, otherwise audioMinSec, default 0.5s
+        const minDuration = vadSilenceMs !== undefined
+          ? vadSilenceMs / 1000
+          : this.options.audioMinSec
+
+        if (silenceDuration > minDuration) {
+
+          // === END RECORDING ===
+          this.log(`VAD: Speech End detected (Silence: ${silenceDuration.toFixed(2)}s)`)
+          this.isSpeechActive = false
+
+          // Append final chunk
+          this.sliceManager.addAudioData(data)
+
+          this.emitVadEvent('speech_end')
+          await this.nextSlice()
+        } else {
+          // Still recording (Silence Gap)
+          this.sliceManager.addAudioData(data)
+          // We might want to transcribe here too to capture the gap?
+          this.triggerTranscription(false)
+        }
+      } else {
+        // Listening... Silence...
+        this.emitVadEvent('silence')
+      }
     }
   }
 
   /**
-   * Detect speech using VAD context
+   * Trigger transcription for the current slice
    */
-  private async detectSpeech(
-    audioData: Uint8Array,
-    sliceIndex: number,
-  ): Promise<RealtimeVadEvent> {
-    if (!this.vadContext) {
-      // When no VAD context is available, assume speech is always detected
-      // but still follow the state machine pattern
-      const currentTimestamp = Date.now()
+  private triggerTranscription(isFinal: boolean): void {
+    const sliceInfo = this.sliceManager.getCurrentSliceInfo()
+    const slice = this.sliceManager.getSliceByIndex(sliceInfo.currentSliceIndex)
 
-      // Assume speech is always detected when no VAD context
-      const vadEventType: RealtimeVadEvent['type'] =
-        this.lastVadState === 'silence' ? 'speech_start' : 'speech_continue'
+    if (!slice || slice.sampleCount === 0) return
 
-      // Update VAD state
-      this.lastVadState = 'speech'
-
-      const { sampleRate = 16000 } = this.options.audioStreamConfig || {}
-      return {
-        type: vadEventType,
-        lastSpeechDetectedTime: 0,
-        timestamp: currentTimestamp,
-        confidence: 1.0,
-        duration: audioData.length / sampleRate / 2, // Convert bytes to seconds
-        sliceIndex,
-      }
+    // Queue transcription
+    const audioData = this.sliceManager.getAudioDataForTranscription(slice.index)
+    if (audioData) {
+      this.transcriptionQueue.push({
+        sliceIndex: slice.index,
+        audioData,
+        isFinal // Pass flag to processTranscription (need update)
+      })
+      this.processTranscriptionQueue().catch(e => this.handleError(e))
     }
+  }
 
-    try {
-      const audioBuffer = audioData.buffer as ArrayBuffer
-
-      // Use VAD context to detect speech segments
-      const vadSegments = await this.vadContext.detectSpeechData(
-        audioBuffer,
-        this.options.vadOptions,
-      )
-
-      // Calculate confidence based on speech segments
-      let confidence = 0.0
-      let lastSpeechDetectedTime = 0
-      if (vadSegments && vadSegments.length > 0) {
-        // If there are speech segments, calculate average confidence
-        const totalTime = vadSegments.reduce(
-          (sum, segment) => sum + (segment.t1 - segment.t0),
-          0,
-        )
-        const audioDuration = audioData.length / 16000 / 2 // Convert bytes to seconds
-        confidence =
-          totalTime > 0 ? Math.min(totalTime / audioDuration, 1.0) : 0.0
-        lastSpeechDetectedTime = vadSegments[vadSegments.length - 1]?.t1 || -1
-      }
-
-      const threshold = this.options.vadOptions.threshold || 0.5
-      let isSpeech = confidence > threshold
-      const currentTimestamp = Date.now()
-
-      // Determine VAD event type based on current and previous state
-      let vadEventType: RealtimeVadEvent['type']
-      if (isSpeech) {
-        vadEventType =
-          this.lastVadState === 'silence' ? 'speech_start' : 'speech_continue'
-
-        const minDuration = this.options.audioMinSec
-        // Check if this is a new speech detection (different from last detected time)
-        if (
-          lastSpeechDetectedTime === this.lastSpeechDetectedTime ||
-          (lastSpeechDetectedTime - this.lastSpeechDetectedTime) / 100 <
-            minDuration
-        ) {
-          if (this.lastVadState === 'silence') vadEventType = 'silence'
-          if (this.lastVadState === 'speech') vadEventType = 'speech_end'
-          isSpeech = false
-          confidence = 0.0
-        }
-        this.lastSpeechDetectedTime = lastSpeechDetectedTime
-      } else {
-        vadEventType = this.lastVadState === 'speech' ? 'speech_end' : 'silence'
-      }
-
-      // Update VAD state for next detection
-      this.lastVadState = isSpeech ? 'speech' : 'silence'
-
-      const { sampleRate = 16000 } = this.options.audioStreamConfig || {}
-      return {
-        type: vadEventType,
-        lastSpeechDetectedTime,
-        timestamp: currentTimestamp,
-        confidence,
-        duration: audioData.length / sampleRate / 2, // Convert bytes to seconds
-        sliceIndex,
-        currentThreshold: threshold,
-      }
-    } catch (error) {
-      this.log(`VAD detection error: ${error}`)
-      // Re-throw the error so it can be handled by the caller
-      throw error
+  private emitVadEvent(type: RealtimeVadEvent['type']): void {
+    const sliceInfo = this.sliceManager.getCurrentSliceInfo()
+    const event: RealtimeVadEvent = {
+      type,
+      timestamp: Date.now(),
+      sliceIndex: sliceInfo.currentSliceIndex,
+      confidence: 1.0,
+      lastSpeechDetectedTime: -1,
+      duration: this.sliceManager.getSliceByIndex(sliceInfo.currentSliceIndex)?.data.length ? this.sliceManager.getSliceByIndex(sliceInfo.currentSliceIndex)!.data.length / 32000 : 0
     }
+    this.vadEvents.set(sliceInfo.currentSliceIndex, event)
+    this.callbacks.onVad?.(event)
   }
 
   private isProcessingTranscriptionQueue = false
+
+  private processingPromise: Promise<void> | null = null
 
   /**
    * Process the transcription queue
    */
   private async processTranscriptionQueue(): Promise<void> {
-    if (this.isProcessingTranscriptionQueue) return
+    if (this.isProcessingTranscriptionQueue && this.processingPromise) {
+      return this.processingPromise
+    }
 
     this.isProcessingTranscriptionQueue = true
 
-    while (this.transcriptionQueue.length > 0) {
-      const item = this.transcriptionQueue.shift()
-      this.transcriptionQueue = [] // Old items are not needed anymore
-      if (item) {
-        // eslint-disable-next-line no-await-in-loop
-        await this.processTranscription(item).catch((error) => {
-          this.handleError(`Transcription error: ${error}`)
-        })
+    this.processingPromise = (async () => {
+      while (this.transcriptionQueue.length > 0) {
+        const item = this.transcriptionQueue.shift() // shift() modifies the array
+        if (item) {
+          // eslint-disable-next-line no-await-in-loop
+          await this.processTranscription(item).catch((error) => {
+            this.handleError(`Transcription error: ${error}`)
+          })
+        }
       }
-    }
+      this.isProcessingTranscriptionQueue = false
+      this.processingPromise = null
+    })()
 
-    this.isProcessingTranscriptionQueue = false
+    return this.processingPromise
   }
 
   /**
@@ -801,6 +547,7 @@ export class RealtimeTranscriber {
   private async processTranscription(item: {
     sliceIndex: number
     audioData: Uint8Array
+    isFinal?: boolean
   }): Promise<void> {
     if (!this.isActive) {
       return
@@ -830,7 +577,31 @@ export class RealtimeTranscriber {
       // Normalize result and segments, remove "[ silence ]" or "[BLANK]"
       result.result = result.result.replace(SILENCE_SEGMENT_REGEX, '').trim()
 
-      // Create transcribe event
+      const slice = this.sliceManager.getSliceByIndex(item.sliceIndex)
+      if (!slice) {
+        this.log(`Slice not found for index ${item.sliceIndex}, skipping transcription processing.`)
+        return
+      }
+
+      // Check if user wants to filter this transcription
+      if (this.callbacks.onBeginTranscribe) {
+        const { sampleRate = 16000 } = this.options.audioStreamConfig || {}
+        const duration = (item.audioData.length / 2) / (sampleRate / 1000) // ms
+
+        const shouldContinue = await this.callbacks.onBeginTranscribe({
+          audioData: item.audioData,
+          sliceIndex: slice.index,
+          duration,
+          vadEvent: this.vadEvents.get(item.sliceIndex)
+        })
+
+        if (!shouldContinue) {
+          this.log(`Transcription filtered by onBeginTranscribe for slice ${slice.index}`)
+          return
+        }
+      }
+
+      // Create new transcription event
       const { sampleRate = 16000 } = this.options.audioStreamConfig || {}
       const transcribeEvent: RealtimeTranscribeEvent = {
         type: 'transcribe',
@@ -851,7 +622,6 @@ export class RealtimeTranscriber {
       }
 
       // Save transcription results
-      const slice = this.sliceManager.getSliceByIndex(item.sliceIndex)
       if (slice) {
         this.transcriptionResults.set(item.sliceIndex, {
           slice: {
@@ -870,39 +640,25 @@ export class RealtimeTranscriber {
       // Emit transcribe event
       this.callbacks.onTranscribe?.(transcribeEvent)
 
-      this.vadEvents.delete(item.sliceIndex)
+      // Feed result to stabilizer for realtime updates
+      // Only stabilize final results (speech_end) to match legacy behavior
+      const resultText = result.result?.trim() || ''
+      if (item.isFinal) {
+        this.callbacks.onSliceTranscriptionStabilized?.(resultText)
+        this.vadEvents.delete(item.sliceIndex)
+      }
 
       // Emit stats update for memory/slice changes
       this.emitStatsUpdate('memory_change')
 
       this.log(
-        `Transcribed speech segment ${item.sliceIndex}: "${result.result}"`,
+        `Transcribed speech segment ${item.sliceIndex} (Final=${!!item.isFinal}): "${result.result}"`,
       )
     } catch (error) {
-      // Emit error event to transcribe callback
-      const errorEvent: RealtimeTranscribeEvent = {
-        type: 'error',
-        sliceIndex: item.sliceIndex,
-        data: undefined,
-        isCapturing: this.audioStream.isRecording(),
-        processTime: Date.now() - startTime,
-        recordingTime: 0,
-        memoryUsage: this.sliceManager.getMemoryUsage(),
-        vadEvent: this.vadEvents.get(item.sliceIndex),
-      }
-
-      this.callbacks.onTranscribe?.(errorEvent)
-
-      this.vadEvents.delete(item.sliceIndex)
-
-      this.handleError(
-        `Transcription failed for speech segment ${item.sliceIndex}: ${error}`,
-      )
+      // ... error handling ...
+      this.handleError(`Transcription error: ${error}`)
     } finally {
-      // Check if we should continue processing queue
-      if (this.transcriptionQueue.length > 0) {
-        await this.processTranscriptionQueue()
-      } else {
+      if (this.transcriptionQueue.length === 0) {
         this.isTranscribing = false
       }
     }
@@ -983,19 +739,19 @@ export class RealtimeTranscriber {
       vadEnabled: this.vadEnabled,
       audioStats: {
         isRecording: this.audioStream.isRecording(),
-        accumulatedSamples: this.accumulatedData.length,
+        accumulatedSamples: 0, // No longer tracked
       },
       vadStats: this.vadEnabled
         ? {
-            enabled: true,
-            contextAvailable: !!this.vadContext,
-            lastSpeechDetectedTime: this.lastSpeechDetectedTime,
-            isProcessing: this.isProcessingVAD,
-            queueSize: this.vadProcessingQueue.length,
-            skippedCount: this.skippedVadCount,
-            throttleMs: this.options.vadThrottleMs,
-            skipRatio: this.options.vadSkipRatio,
-          }
+          enabled: true,
+          contextAvailable: !!this.vadContext,
+          lastSpeechDetectedTime: this.lastSpeechDetectedTime,
+          isProcessing: false,
+          queueSize: 0,
+          skippedCount: 0,
+          throttleMs: this.options.vadThrottleMs,
+          skipRatio: this.options.vadSkipRatio,
+        }
         : null,
       sliceStats: this.sliceManager.getCurrentSliceInfo(),
       autoSliceConfig: {
@@ -1056,16 +812,16 @@ export class RealtimeTranscriber {
         `Forced slice ${result.slice.index} ready (${result.slice.data.length} bytes)`,
       )
 
-      // Process VAD for the slice if enabled (with throttling for low-end CPU)
-      if (!this.isTranscribing && this.vadEnabled) {
-        this.queueVADProcessing(result.slice)
-      } else if (!this.isTranscribing) {
-        // If VAD is disabled, transcribe slices as they become ready
-        this.queueSliceForTranscription(result.slice).catch((error: any) => {
-          this.handleError(`Failed to queue slice for transcription: ${error}`)
+      // Queue for transcription (Final)
+      if (result.slice.data.length > 0) {
+        this.transcriptionQueue.push({
+          sliceIndex: result.slice.index,
+          audioData: result.slice.data,
+          isFinal: true
         })
-      } else {
-        this.log(`Skipping slice ${result.slice.index} - already transcribing`)
+        this.processTranscriptionQueue().catch((error) => {
+          this.handleError(`Failed to process forced slice: ${error}`)
+        })
       }
 
       this.emitStatsUpdate('memory_change')
@@ -1081,17 +837,10 @@ export class RealtimeTranscriber {
     this.sliceManager.reset()
     this.transcriptionQueue = []
     this.isTranscribing = false
-    this.accumulatedData = new Uint8Array(0)
 
-    // Reset simplified VAD state
+    // Reset VAD state
     this.lastSpeechDetectedTime = -1
-    this.lastVadState = 'silence'
-
-    // Reset VAD throttling state
-    this.isProcessingVAD = false
-    this.lastVadProcessTime = 0
-    this.vadProcessingQueue = []
-    this.skippedVadCount = 0
+    this.silenceStartTime = 0
 
     // Reset stats snapshot for clean start
     this.lastStatsSnapshot = null
@@ -1109,6 +858,13 @@ export class RealtimeTranscriber {
 
     // Clear VAD events
     this.vadEvents.clear()
+
+    this.isSpeechActive = false
+
+    // Clear pre-recording buffer
+    if (this.preRecordingBuffer) {
+      this.preRecordingBuffer.clear()
+    }
   }
 
   /**

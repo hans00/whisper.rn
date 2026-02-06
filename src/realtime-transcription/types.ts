@@ -209,6 +209,14 @@ export interface RealtimeOptions {
 
   // Logger settings
   logger?: (message: string) => void // default: noop - custom logger function
+
+  // Realtime transcription settings
+  realtimeProcessingPauseSec?: number // default: 0.2 - interval between realtime updates
+  initRealtimeAfterSec?: number // default: 0.2 - wait before first realtime transcription
+
+  // VAD Performance Optimization
+  preRecordingBufferSec?: number // default: 1.0 - ring buffer duration for pre-recording audio
+  energyThreshold?: number // default: 0 (disabled) - RMS energy threshold for fast pre-VAD filtering (0.0-1.0)
 }
 
 export interface AudioSlice {
@@ -221,7 +229,7 @@ export interface AudioSlice {
   isReleased: boolean
 }
 
-export interface AudioSliceNoData extends Omit<AudioSlice, 'data'> {}
+export interface AudioSliceNoData extends Omit<AudioSlice, 'data'> { }
 
 export interface MemoryUsage {
   slicesInMemory: number
@@ -232,10 +240,10 @@ export interface MemoryUsage {
 export interface RealtimeStatsEvent {
   timestamp: number
   type:
-    | 'slice_processed'
-    | 'vad_change'
-    | 'memory_change'
-    | 'status_change'
+  | 'slice_processed'
+  | 'vad_change'
+  | 'memory_change'
+  | 'status_change'
   data: {
     isActive: boolean
     isTranscribing: boolean
@@ -263,6 +271,8 @@ export interface RealtimeTranscriberCallbacks {
   onError?: (error: string) => void
   onStatusChange?: (isActive: boolean) => void
   onStatsUpdate?: (event: RealtimeStatsEvent) => void
+
+  onSliceTranscriptionStabilized?: (text: string) => void
 }
 
 // === Context Interfaces ===

@@ -133,6 +133,7 @@ export default function RealtimeTranscriberDemo() {
   const [isTranscribing, setIsTranscribing] = useState(false)
   const [realtimeStats, setRealtimeStats] = useState<any>(null)
   const [vadEvents, setVadEvents] = useState<RealtimeVadEvent[]>([])
+  const [stabilizedText, setStabilizedText] = useState<string>('')
 
   // Auto-slice configuration
   const [autoSliceOnSpeechEnd, setAutoSliceOnSpeechEnd] = useState(true)
@@ -421,6 +422,10 @@ export default function RealtimeTranscriberDemo() {
           onError: handleError,
           onStatusChange: handleStatusChange,
           onStatsUpdate: handleStatsUpdate,
+          onSliceTranscriptionStabilized: (text: string) => {
+            setStabilizedText(text)
+            log(`Stabilized: "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"`)
+          },
         },
       )
 
@@ -429,8 +434,7 @@ export default function RealtimeTranscriberDemo() {
       // Start transcription
       await realtimeTranscriberRef.current.start()
       log(
-        `Realtime transcription started (${
-          useFileSimulation ? 'File Simulation - JFK Speech' : 'Live Audio'
+        `Realtime transcription started (${useFileSimulation ? 'File Simulation - JFK Speech' : 'Live Audio'
         })`,
       )
     } catch (error) {
@@ -475,8 +479,7 @@ export default function RealtimeTranscriberDemo() {
                 (slice.endTime - slice.startTime) /
                 1000
               ).toFixed(1)}s\n` +
-              `Memory: ${
-                transcribeEvent.memoryUsage?.slicesInMemory || 0
+              `Memory: ${transcribeEvent.memoryUsage?.slicesInMemory || 0
               } slices, ${transcribeEvent.memoryUsage?.estimatedMB || 0}MB\n` +
               `Segments:\n${resultData.segments
                 .map(
@@ -519,8 +522,7 @@ export default function RealtimeTranscriberDemo() {
     // Log significant changes
     if (statsEvent.type === 'status_change') {
       log(
-        `Status changed: ${
-          statsEvent.data.isActive ? 'ACTIVE' : 'INACTIVE'
+        `Status changed: ${statsEvent.data.isActive ? 'ACTIVE' : 'INACTIVE'
         }, transcribing: ${statsEvent.data.isTranscribing}`,
       )
     } else if (statsEvent.type === 'memory_change') {
@@ -569,7 +571,7 @@ export default function RealtimeTranscriberDemo() {
       audioStreamRef.current &&
       'setPlaybackSpeed' in audioStreamRef.current
     ) {
-      ;(audioStreamRef.current as any).setPlaybackSpeed(nextSpeed)
+      ; (audioStreamRef.current as any).setPlaybackSpeed(nextSpeed)
     }
   }
 
@@ -584,7 +586,7 @@ export default function RealtimeTranscriberDemo() {
     }
 
     const targetTime = simulationStats.totalDuration * (percentage / 100)
-    ;(audioStreamRef.current as any).seekToTime(targetTime)
+      ; (audioStreamRef.current as any).seekToTime(targetTime)
     log(`Seeked to ${targetTime.toFixed(1)}s (${percentage}%)`)
   }
 
@@ -596,6 +598,7 @@ export default function RealtimeTranscriberDemo() {
     setVadEvents([])
     setRealtimeStats(null)
     setSimulationStats(null)
+    setStabilizedText('')
     log('Reset all components')
   }
 
@@ -962,6 +965,16 @@ export default function RealtimeTranscriberDemo() {
                   realtimeStats.autoSliceConfig.targetDuration *
                   realtimeStats.autoSliceConfig.threshold
                 ).toFixed(1)}s)`}
+            </Text>
+          </View>
+        )}
+
+        {/* Stabilized Transcription */}
+        {stabilizedText && (
+          <View style={[styles.logContainer, { backgroundColor: '#e3f2fd' }]}>
+            <Text style={styles.configTitle}>Stabilized Transcription</Text>
+            <Text style={[styles.logText, { fontSize: 16, fontWeight: '500' }]}>
+              {stabilizedText}
             </Text>
           </View>
         )}

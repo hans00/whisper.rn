@@ -182,18 +182,6 @@ export interface RealtimeOptions {
   audioMinSec?: number // default: 1
   maxSlicesInMemory?: number // default: 3
 
-  // VAD settings - now using extended options
-  vadOptions?: VadOptions
-  vadPreset?: keyof typeof VAD_PRESETS // Quick preset selection
-
-  // Auto-slice settings
-  autoSliceOnSpeechEnd?: boolean // default: false - automatically slice when speech ends and duration thresholds are met
-  autoSliceThreshold?: number // default: 0.85 - percentage of audioSliceSec to trigger auto-slice
-
-  // VAD optimization options for low-end CPU
-  vadThrottleMs?: number // default: 1500 - Minimum time between VAD calls (ms)
-  vadSkipRatio?: number // default: 0 - Skip every Nth slice (0 = no skipping)
-
   // Transcription settings
   transcribeOptions?: TranscribeOptions
 
@@ -271,7 +259,6 @@ export interface RealtimeTranscriberCallbacks {
   onError?: (error: string) => void
   onStatusChange?: (isActive: boolean) => void
   onStatsUpdate?: (event: RealtimeStatsEvent) => void
-
   onSliceTranscriptionStabilized?: (text: string) => void
 }
 
@@ -287,6 +274,7 @@ export type WhisperContextLike = {
   }
 }
 
+// VAD context interface
 export type WhisperVadContextLike = {
   detectSpeechData: (
     data: ArrayBuffer,
@@ -294,9 +282,26 @@ export type WhisperVadContextLike = {
   ) => Promise<Array<{ t0: number; t1: number }>>
 }
 
+export interface RealtimeVadContextLike {
+  // Push audio data to the VAD context
+  processAudio(data: ArrayBuffer): void
+  // Callback for when speech is detected
+  onSpeechStart: (callback: (data: ArrayBuffer) => Promise<void>) => void
+  // Callback for when speech ends
+  onSpeechEnd: (callback: (data: ArrayBuffer) => Promise<void>) => void
+  // Callback for when VAD encounters an error
+  onError: (callback: (error: string) => void) => void
+  // Update VAD options
+  updateOptions(options: Partial<VadOptions>): void
+  // Force flush remaining audio data in the VAD context
+  flush(): Promise<void>
+  // Reset the VAD context
+  reset(): Promise<void>
+}
+
 export interface RealtimeTranscriberDependencies {
   whisperContext: WhisperContextLike
-  vadContext?: WhisperVadContextLike
+  vadContext?: RealtimeVadContextLike
   audioStream: AudioStreamInterface
   fs?: WavFileWriterFs
 }

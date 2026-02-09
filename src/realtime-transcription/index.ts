@@ -6,6 +6,7 @@ export { SliceManager } from './SliceManager'
 
 // Ring buffer for pre-recording audio
 export { RingBuffer } from './RingBuffer'
+export { RingBufferVad } from './RingBufferVad'
 
 export type { WavFileWriterFs } from '../utils/WavFileWriter'
 

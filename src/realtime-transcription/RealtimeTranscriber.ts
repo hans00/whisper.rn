@@ -672,13 +672,11 @@ export class RealtimeTranscriber {
     this.callbacks.onTranscribe?.(startEvent)
 
     // Check if there are pending transcriptions or currently transcribing
+    // We don't need to wait explicitly because the queue handles serialization
     if (this.isTranscribing || this.transcriptionQueue.length > 0) {
       this.log(
-        'Waiting for pending transcriptions to complete before forcing next slice...',
+        'Queuing forced slice after pending transcriptions...',
       )
-
-      // Wait for current transcription queue to be processed
-      await this.processTranscriptionQueue()
     }
 
     const result = this.sliceManager.forceNextSlice()

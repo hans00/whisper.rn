@@ -266,6 +266,9 @@ export class RingBufferVad implements RealtimeVadContextLike {
                 this.silenceStartTime = 0
                 this.speechEndedCallback?.(1 - speechRate)
             }
+        } else if (this.isSpeechActive) {
+            // Emit continue to keep recording during silence/gaps
+            this.speechContinueCallback?.(speechRate, newChunkData)
         }
     }
 

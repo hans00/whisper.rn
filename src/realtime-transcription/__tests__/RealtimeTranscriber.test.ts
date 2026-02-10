@@ -288,7 +288,7 @@ describe('RealtimeTranscriber', () => {
       // Use any data size - the WAV writer should be called for any audio data
       const testData = new Uint8Array(100)
       testData.fill(1)
-      testAudioStream.simulateDataChunk(testData)
+      audioStream.simulateDataChunk(testData)
 
       expect(mockWavFileWriter.initialize).toHaveBeenCalled()
       expect(mockWavFileWriter.appendAudioData).toHaveBeenCalled()

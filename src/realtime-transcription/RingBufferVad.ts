@@ -8,8 +8,10 @@ import type { VadOptions } from '../index'
 export type RingBufferVadOptions = {
     vadOptions?: VadOptions
     vadPreset?: keyof typeof VAD_PRESETS
-    preRecordingBufferSec?: number
+    preRecordingBufferMs?: number
     sampleRate?: number
+    inferenceIntervalMs?: number
+    speechRateThreshold?: number
     logger?: (message: string) => void
 }
 
@@ -28,11 +30,19 @@ export class RingBufferVad implements RealtimeVadContextLike {
 
     private activeVadPromises: Set<Promise<any>> = new Set()
 
-    private speechDetectedCallback: ((data: ArrayBuffer) => Promise<void>) | null = null
+    private vadInferenceQueue: Array<() => Promise<void>> = []
 
-    private speechEndedCallback: ((data: ArrayBuffer) => Promise<void>) | null = null
+    private isProcessingVad = false
+
+    private speechDetectedCallback: ((confidence: number, data: ArrayBuffer) => Promise<void>) | null = null
+
+    private speechEndedCallback: ((confidence: number) => Promise<void>) | null = null
 
     private errorCallback: ((error: string) => void) | null = null
+
+    private chunkAccumulated: number = 0
+
+    private targetChunkSize: number
 
     constructor(
         vadContext: WhisperVadContextLike,
@@ -42,8 +52,10 @@ export class RingBufferVad implements RealtimeVadContextLike {
         this.options = {
             vadOptions: options.vadOptions || VAD_PRESETS.default,
             vadPreset: options.vadPreset,
-            preRecordingBufferSec: options.preRecordingBufferSec ?? 1.0,
+            preRecordingBufferMs: options.preRecordingBufferMs ?? 1000,
             sampleRate: options.sampleRate || 16000,
+            inferenceIntervalMs: options.inferenceIntervalMs || 500,
+            speechRateThreshold: options.speechRateThreshold || 0.3,
             logger: options.logger || (() => { })
         }
 
@@ -55,16 +67,23 @@ export class RingBufferVad implements RealtimeVadContextLike {
             }
         }
 
+        // Check preRecordingBufferSec should > inferenceIntervalMs
+        if (this.options.preRecordingBufferMs! < this.options.inferenceIntervalMs!) {
+            throw new Error('preRecordingBufferMs must be greater than inferenceIntervalMs')
+        }
+
         // Initialize RingBuffer
-        const bufferSize = Math.floor((this.options.preRecordingBufferSec!) * (this.options.sampleRate!) * 2) // 16-bit samples
+        const bufferSize = Math.floor((this.options.preRecordingBufferMs!) * (this.options.sampleRate!) * 2) // 16-bit samples
         this.ringBuffer = new RingBuffer(bufferSize)
+
+        this.targetChunkSize = Math.floor((this.options.inferenceIntervalMs! / 1000) * (this.options.sampleRate!) * 2)
     }
 
-    onSpeechStart(callback: (data: ArrayBuffer) => Promise<void>): void {
+    onSpeechStart(callback: (confidence: number, data: ArrayBuffer) => Promise<void>): void {
         this.speechDetectedCallback = callback
     }
 
-    onSpeechEnd(callback: (data: ArrayBuffer) => Promise<void>): void {
+    onSpeechEnd(callback: (confidence: number) => Promise<void>): void {
         this.speechEndedCallback = callback
     }
 
@@ -78,16 +97,30 @@ export class RingBufferVad implements RealtimeVadContextLike {
         // 1. Push to Ring Buffer
         this.ringBuffer.write(u8Data)
 
-        // 2. Run VAD
-        const vadPromise = this.processVad(data)
-        this.activeVadPromises.add(vadPromise)
+        this.chunkAccumulated += u8Data.byteLength
 
-        vadPromise.finally(() => {
-            this.activeVadPromises.delete(vadPromise)
-        })
+        // 2. Run VAD
+        if (this.chunkAccumulated >= this.targetChunkSize) {
+            this.chunkAccumulated = 0
+            const vadPromise = this.processVad()
+            this.activeVadPromises.add(vadPromise)
+
+            vadPromise.finally(() => {
+                this.activeVadPromises.delete(vadPromise)
+            })
+        }
     }
 
     async flush(): Promise<void> {
+        // Force process last chunk if any
+        if (this.chunkAccumulated > 0) {
+            const vadPromise = this.processVad()
+            this.activeVadPromises.add(vadPromise)
+
+            vadPromise.finally(() => {
+                this.activeVadPromises.delete(vadPromise)
+            })
+        }
         // Wait for any active VAD processing to finish
         await Promise.allSettled([...this.activeVadPromises])
     }
@@ -95,54 +128,85 @@ export class RingBufferVad implements RealtimeVadContextLike {
     async reset(): Promise<void> {
         await this.flush()
         this.activeVadPromises.clear()
+        this.vadInferenceQueue.length = 0
+        this.isProcessingVad = false
         this.ringBuffer.clear()
+        this.chunkAccumulated = 0
         this.isSpeechActive = false
         this.silenceStartTime = 0
         this.currentSpeechStartTime = 0
     }
 
-    private async processVad(currentData: ArrayBuffer): Promise<void> {
-        let speechRate = 0
-        try {
-            const vadInput = this.ringBuffer.read()
-            if (vadInput.byteLength > 0) {
-                const vadInputBuffer = vadInput.buffer as ArrayBuffer
+    private async processVad(): Promise<void> {
+        return new Promise((resolve) => {
+            // Enqueue the VAD task
+            this.vadInferenceQueue.push(async () => {
+                let lastSpeechOffset = -1
+                let speechRate = 0
+                let vadInput: Uint8Array
+                try {
+                    vadInput = this.ringBuffer.read()
+                    if (vadInput.byteLength > 0) {
+                        const vadInputBuffer = vadInput.buffer as ArrayBuffer
 
-                const segments = await this.vadContext.detectSpeechData(
-                    vadInputBuffer,
-                    this.options.vadOptions!
-                )
+                        // This is now guaranteed to run sequentially
+                        const segments = await this.vadContext.detectSpeechData(
+                            vadInputBuffer,
+                            this.options.vadOptions!
+                        )
 
-                const audioLength = vadInput.byteLength / 2 / (this.options.sampleRate || 16000)
-                // t0/t1 is 10ms unit
-                speechRate = segments.reduce((acc, { t0, t1 }) => acc + (t1 - t0) / 100, 0) / audioLength
-            }
-        } catch (error: any) {
-            this.log(`VAD error: ${error}`)
-            this.errorCallback?.(`VAD processing error: ${error.message || error}`)
+                        const audioLength = vadInput.byteLength / 2 / (this.options.sampleRate || 16000)
+                        // t0/t1 is 10ms unit
+                        speechRate = segments.reduce((acc, { t0, t1 }) => acc + (t1 - t0) / 100, 0) / audioLength
+                        lastSpeechOffset = segments.length > 0 ? segments[segments.length - 1]!.t1 * 10 : -1
+                    }
+                } catch (error: any) {
+                    this.log(`VAD error: ${error}`)
+                    this.errorCallback?.(`VAD processing error: ${error.message || error}`)
+                    resolve()
+                    return
+                }
+
+                await this.handleVadStateChange(lastSpeechOffset, speechRate, vadInput)
+                resolve()
+            })
+
+            // Start processing the queue
+            this.processVadQueue()
+        })
+    }
+
+    private async processVadQueue(): Promise<void> {
+        // If already processing, return (the current processor will handle the queue)
+        if (this.isProcessingVad) {
             return
         }
 
-        await this.handleVadStateChange(speechRate, new Uint8Array(currentData))
+        this.isProcessingVad = true
+
+        while (this.vadInferenceQueue.length > 0) {
+            const task = this.vadInferenceQueue.shift()
+            if (task) {
+                await task() // eslint-disable-line no-await-in-loop
+            }
+        }
+
+        this.isProcessingVad = false
     }
 
-    private async handleVadStateChange(speechRate: number, currentData: Uint8Array): Promise<void> {
-        const threshold = this.options.vadOptions?.threshold || 0.5
+    private async handleVadStateChange(lastSpeechOffset: number, speechRate: number, currentData: Uint8Array): Promise<void> {
+        const timeOffset = (this.options.preRecordingBufferMs!) - lastSpeechOffset
+        const minSpeechDurationMs = this.options.vadOptions?.minSpeechDurationMs || 100
 
         // Logic ported from RealtimeTranscriber.ts
-        if (speechRate > threshold) {
+        if (speechRate > this.options.speechRateThreshold!) {
             this.silenceStartTime = 0
 
             if (!this.isSpeechActive) {
                 // Speech Start
                 this.isSpeechActive = true
-                this.log('Speech detected')
-
-                // Read from RingBuffer (pre-roll)
-                const preRoll = this.ringBuffer.read()
-                this.currentSpeechStartTime = Date.now() - (this.options.preRecordingBufferSec! * 1000)
-
-                await this.speechDetectedCallback?.(preRoll.buffer as ArrayBuffer)
+                this.currentSpeechStartTime = Date.now() - timeOffset
+                await this.speechDetectedCallback?.(speechRate, currentData.buffer as ArrayBuffer)
             } else {
                 // Speech Continue
                 // Check max duration
@@ -150,21 +214,18 @@ export class RingBufferVad implements RealtimeVadContextLike {
                 const currentDurationMs = Date.now() - this.currentSpeechStartTime
 
                 if (currentDurationMs > maxDurationS * 1000) {
-                    this.log('Max speech duration exceeded')
                     this.isSpeechActive = false
-
-                    await this.speechEndedCallback?.(new ArrayBuffer(0))
+                    await this.speechEndedCallback?.(1.0)
 
                     // Immediately restart
                     this.isSpeechActive = true
                     this.currentSpeechStartTime = Date.now()
-
-                    await this.speechDetectedCallback?.(currentData.buffer as ArrayBuffer)
+                    await this.speechDetectedCallback?.(speechRate, currentData.buffer as ArrayBuffer)
                 }
             }
-        } else if (this.isSpeechActive) { // Silence
+        } else if (this.isSpeechActive && (Date.now() - this.currentSpeechStartTime) > minSpeechDurationMs) { // Silence
             if (this.silenceStartTime === 0) {
-                this.silenceStartTime = Date.now()
+                this.silenceStartTime = Date.now() + timeOffset
             }
 
             const silenceDuration = (Date.now() - this.silenceStartTime) / 1000
@@ -173,9 +234,7 @@ export class RingBufferVad implements RealtimeVadContextLike {
             if (silenceDuration > minSilenceDurationMs / 1000) {
                 this.isSpeechActive = false
                 this.silenceStartTime = 0
-
-                // Pass empty buffer as state signal
-                await this.speechEndedCallback?.(new ArrayBuffer(0))
+                await this.speechEndedCallback?.(1 - speechRate)
             }
         }
     }

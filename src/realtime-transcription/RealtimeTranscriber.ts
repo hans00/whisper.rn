@@ -51,6 +51,8 @@ export class RealtimeTranscriber {
     promptPreviousSlices: boolean
     audioOutputPath?: string
     audioStreamConfig?: AudioStreamConfig
+    realtimeProcessingPauseMs: number
+    initRealtimeAfterMs: number
     logger: (message: string) => void
   }
 
@@ -75,6 +77,9 @@ export class RealtimeTranscriber {
 
   // Track last stats to emit only when changed
   private lastStatsSnapshot: any = null
+
+  // Track last realtime transcription time for throttling
+  private lastRealtimeTranscriptionTime = 0
 
   // Store transcription results by slice index
   private transcriptionResults: Map<
@@ -108,6 +113,8 @@ export class RealtimeTranscriber {
       initialPrompt: options.initialPrompt,
       promptPreviousSlices: options.promptPreviousSlices ?? true,
       audioOutputPath: options.audioOutputPath,
+      realtimeProcessingPauseMs: options.realtimeProcessingPauseMs || 200,
+      initRealtimeAfterMs: options.initRealtimeAfterMs || 200,
       logger: options.logger || (() => { }),
     }
 
@@ -130,6 +137,7 @@ export class RealtimeTranscriber {
     this.audioStream.onData(this.handleAudioData.bind(this))
     this.audioStream.onError(this.handleError.bind(this))
     this.audioStream.onStatusChange(this.handleAudioStatusChange.bind(this))
+    this.audioStream.onEnd?.(this.handleAudioEnd.bind(this))
   }
 
   /**
@@ -285,7 +293,7 @@ export class RealtimeTranscriber {
 
   // --- VAD Handlers ---
 
-  private async handleSpeechDetected(data: ArrayBuffer): Promise<void> {
+  private async handleSpeechDetected(confidence: number, data: ArrayBuffer): Promise<void> {
     if (!this.isActive) return
     const u8Data = new Uint8Array(data)
 
@@ -294,20 +302,20 @@ export class RealtimeTranscriber {
       this.isSpeechActive = true
       this.log('VAD: Speech Start detected')
       this.lastSpeechDetectedTime = Date.now()
-      this.emitVadEvent('speech_start')
+      this.emitVadEvent('speech_start', confidence)
     } else {
-      this.emitVadEvent('speech_continue')
+      this.emitVadEvent('speech_continue', confidence)
     }
 
     this.sliceManager.addAudioData(u8Data)
     this.triggerTranscription(false)
   }
 
-  private async handleSpeechEnded(_data: ArrayBuffer): Promise<void> {
+  private async handleSpeechEnded(confidence: number): Promise<void> {
     if (!this.isActive) return
 
     this.isSpeechActive = false
-    this.emitVadEvent('speech_end')
+    this.emitVadEvent('speech_end', confidence)
     await this.nextSlice()
   }
 
@@ -323,6 +331,25 @@ export class RealtimeTranscriber {
     // Queue transcription
     const audioData = this.sliceManager.getAudioDataForTranscription(slice.index)
     if (audioData) {
+      // Throttling logic for realtime (non-final) transcriptions
+      if (!isFinal) {
+        const { sampleRate = 16000 } = this.options.audioStreamConfig || {}
+        const durationMs = (audioData.length / 2) / (sampleRate / 1000)
+        const now = Date.now()
+
+        // 1. Initial wait: Don't transcribe if slice is too short (unless it's final, which checks above handle)
+        if (durationMs < this.options.initRealtimeAfterMs) {
+          return
+        }
+
+        // 2. Throttling: Don't transcribe if too soon after last update
+        if (now - this.lastRealtimeTranscriptionTime < this.options.realtimeProcessingPauseMs) {
+          return
+        }
+
+        this.lastRealtimeTranscriptionTime = now
+      }
+
       this.transcriptionQueue.push({
         sliceIndex: slice.index,
         audioData,
@@ -332,13 +359,13 @@ export class RealtimeTranscriber {
     }
   }
 
-  private emitVadEvent(type: RealtimeVadEvent['type']): void {
+  private emitVadEvent(type: RealtimeVadEvent['type'], confidence: number): void {
     const sliceInfo = this.sliceManager.getCurrentSliceInfo()
     const event: RealtimeVadEvent = {
       type,
       timestamp: Date.now(),
       sliceIndex: sliceInfo.currentSliceIndex,
-      confidence: 1.0,
+      confidence,
       lastSpeechDetectedTime: this.lastSpeechDetectedTime,
       duration: this.sliceManager.getSliceByIndex(sliceInfo.currentSliceIndex)?.data.length ? this.sliceManager.getSliceByIndex(sliceInfo.currentSliceIndex)!.data.length / 32000 : 0
     }
@@ -541,6 +568,26 @@ export class RealtimeTranscriber {
   }
 
   /**
+   * Handle audio stream end
+   */
+  private async handleAudioEnd(): Promise<void> {
+    this.log('Audio stream ended')
+
+    if (this.vadContext) {
+      await this.vadContext.flush()
+    }
+
+    // If speech is still active after flush, force end it
+    if (this.isSpeechActive) {
+      this.log('Speech still active after stream end, forcing speech end')
+      await this.handleSpeechEnded(1.0)
+    }
+
+    // Ensure last slice is processed if it has data
+    await this.nextSlice()
+  }
+
+  /**
    * Handle audio status changes
    */
   private handleAudioStatusChange(isRecording: boolean): void {
@@ -674,6 +721,8 @@ export class RealtimeTranscriber {
 
     // Reset stats snapshot for clean start
     this.lastStatsSnapshot = null
+
+    this.lastRealtimeTranscriptionTime = 0
 
     // Cancel WAV file writing if in progress
     if (this.wavFileWriter) {

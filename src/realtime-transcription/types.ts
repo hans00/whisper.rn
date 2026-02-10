@@ -26,6 +26,7 @@ export interface AudioStreamInterface {
   onData(callback: (data: AudioStreamData) => void): void
   onError(callback: (error: string) => void): void
   onStatusChange(callback: (isRecording: boolean) => void): void
+  onEnd?(callback: () => void): void
   release(): Promise<void>
 }
 
@@ -199,12 +200,8 @@ export interface RealtimeOptions {
   logger?: (message: string) => void // default: noop - custom logger function
 
   // Realtime transcription settings
-  realtimeProcessingPauseSec?: number // default: 0.2 - interval between realtime updates
-  initRealtimeAfterSec?: number // default: 0.2 - wait before first realtime transcription
-
-  // VAD Performance Optimization
-  preRecordingBufferSec?: number // default: 1.0 - ring buffer duration for pre-recording audio
-  energyThreshold?: number // default: 0 (disabled) - RMS energy threshold for fast pre-VAD filtering (0.0-1.0)
+  realtimeProcessingPauseMs?: number // default: 200 - interval between realtime updates
+  initRealtimeAfterMs?: number // default: 200 - wait before first realtime transcription
 }
 
 export interface AudioSlice {
@@ -286,9 +283,9 @@ export interface RealtimeVadContextLike {
   // Push audio data to the VAD context
   processAudio(data: ArrayBuffer): void
   // Callback for when speech is detected
-  onSpeechStart: (callback: (data: ArrayBuffer) => Promise<void>) => void
+  onSpeechStart: (callback: (confidence: number, data: ArrayBuffer) => Promise<void>) => void
   // Callback for when speech ends
-  onSpeechEnd: (callback: (data: ArrayBuffer) => Promise<void>) => void
+  onSpeechEnd: (callback: (confidence: number) => Promise<void>) => void
   // Callback for when VAD encounters an error
   onError: (callback: (error: string) => void) => void
   // Update VAD options

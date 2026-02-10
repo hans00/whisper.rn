@@ -915,24 +915,7 @@ export default function RealtimeTranscriberDemo() {
               {useFileSimulation && ` @ ${playbackSpeed}x`}
             </Text>
             <Text style={styles.statusText}>
-              Auto-Slice:{' '}
-              {realtimeStats.autoSliceConfig?.enabled ? 'ENABLED' : 'DISABLED'}
-              {realtimeStats.autoSliceConfig?.enabled &&
-                ` (≥${(realtimeStats.autoSliceConfig.threshold * 100).toFixed(
-                  0,
-                )}% = ${(
-                  realtimeStats.autoSliceConfig.targetDuration *
-                  realtimeStats.autoSliceConfig.threshold
-                ).toFixed(1)}s)`}
-            </Text>
-          </View>
-        )}
-
-        {/* Stabilized Transcription */}
-        {stabilizedText && (
-          <View style={[styles.logContainer, { backgroundColor: '#e3f2fd' }]}>
-            <Text style={styles.configTitle}>Stabilized Transcription</Text>
-            <Text style={[styles.logText, { fontSize: 16, fontWeight: '500' }]}>
+              Stabilized Transcription:{' '}
               {stabilizedText}
             </Text>
           </View>

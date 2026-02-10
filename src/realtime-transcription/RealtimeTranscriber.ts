@@ -123,6 +123,7 @@ export class RealtimeTranscriber {
 
     if (this.vadContext) {
       this.vadContext.onSpeechStart(this.handleSpeechDetected.bind(this))
+      this.vadContext.onSpeechContinue(this.handleSpeechContinue.bind(this))
       this.vadContext.onSpeechEnd(this.handleSpeechEnded.bind(this))
       this.vadContext.onError(this.handleError.bind(this))
     }
@@ -277,13 +278,7 @@ export class RealtimeTranscriber {
         }
       }
 
-      this.vadContext.processAudio(data.buffer as ArrayBuffer)
-
-      // If speech is active, we collect the data immediately
-      if (this.isSpeechActive) {
-        this.sliceManager.addAudioData(data)
-        this.triggerTranscription(false)
-      }
+      this.vadContext.processAudio(data)
     } else {
       // Fallback: If no VAD context, treat everything as speech/audio to be processed
       this.sliceManager.addAudioData(data)
@@ -293,21 +288,24 @@ export class RealtimeTranscriber {
 
   // --- VAD Handlers ---
 
-  private async handleSpeechDetected(confidence: number, data: ArrayBuffer): Promise<void> {
+  private async handleSpeechDetected(confidence: number, data: Uint8Array): Promise<void> {
     if (!this.isActive) return
-    const u8Data = new Uint8Array(data)
-
     if (!this.isSpeechActive) {
       // Speech Start
       this.isSpeechActive = true
       this.log('VAD: Speech Start detected')
       this.lastSpeechDetectedTime = Date.now()
       this.emitVadEvent('speech_start', confidence)
-    } else {
-      this.emitVadEvent('speech_continue', confidence)
-    }
 
-    this.sliceManager.addAudioData(u8Data)
+      this.sliceManager.addAudioData(data)
+      this.triggerTranscription(false)
+    }
+  }
+
+  private async handleSpeechContinue(confidence: number, data: Uint8Array): Promise<void> {
+    if (!this.isActive || !this.isSpeechActive) return
+    this.emitVadEvent('speech_continue', confidence)
+    this.sliceManager.addAudioData(data)
     this.triggerTranscription(false)
   }
 

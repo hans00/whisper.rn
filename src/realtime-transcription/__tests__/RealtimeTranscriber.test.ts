@@ -352,6 +352,26 @@ describe('RealtimeTranscriber', () => {
       )
     })
 
+    it('should emit speech_continue events', async () => {
+      mockWhisperVadContext.detectSpeechData.mockResolvedValue([{ t0: 0, t1: 1000 }])
+
+      // First chunk - Start
+      const audioData1 = createAudioData(16000)
+      mockAudioStream.simulateDataChunk(audioData1)
+      await new Promise(resolve => setTimeout(resolve, 100))
+
+      // Second chunk - Continue
+      const audioData2 = createAudioData(16000)
+      mockAudioStream.simulateDataChunk(audioData2)
+      await new Promise(resolve => setTimeout(resolve, 100))
+
+      expect(mockCallbacks.onVad).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'speech_continue'
+        })
+      )
+    })
+
     it('should handle VAD processing errors', async () => {
       // Mock the underlying VAD context to throw an error
       mockWhisperVadContext.detectSpeechData.mockRejectedValueOnce(new Error('VAD error'))

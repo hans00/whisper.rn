@@ -281,11 +281,13 @@ export type WhisperVadContextLike = {
 
 export interface RealtimeVadContextLike {
   // Push audio data to the VAD context
-  processAudio(data: ArrayBuffer): void
+  processAudio(data: Uint8Array): void
   // Callback for when speech is detected
-  onSpeechStart: (callback: (confidence: number, data: ArrayBuffer) => Promise<void>) => void
+  onSpeechStart: (callback: (confidence: number, data: Uint8Array) => void) => void
+  // Callback for when speech is detected and continues
+  onSpeechContinue: (callback: (confidence: number, data: Uint8Array) => void) => void
   // Callback for when speech ends
-  onSpeechEnd: (callback: (confidence: number) => Promise<void>) => void
+  onSpeechEnd: (callback: (confidence: number) => void) => void
   // Callback for when VAD encounters an error
   onError: (callback: (error: string) => void) => void
   // Update VAD options

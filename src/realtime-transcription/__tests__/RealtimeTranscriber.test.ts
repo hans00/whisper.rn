@@ -263,7 +263,7 @@ describe('RealtimeTranscriber', () => {
 
     it('should write to WAV file when configured', async () => {
       // Create a new audio stream instance for this test to avoid interference
-      const testAudioStream = new JestAudioStreamAdapter({
+      const audioStream = new JestAudioStreamAdapter({
         chunkSize: 3200,
         chunkInterval: 100,
         generateSilence: false,
@@ -272,7 +272,7 @@ describe('RealtimeTranscriber', () => {
       const wavTranscriber = new RealtimeTranscriber(
         {
           whisperContext: mockWhisperContext,
-          audioStream: testAudioStream,
+          audioStream,
           fs: mockFs,
         },
         {

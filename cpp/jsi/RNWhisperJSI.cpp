@@ -889,6 +889,7 @@ struct TranscribeConfig {
     bool tdrzEnable = false;
     // audioCtx: 'auto' — resolved against the input length once it is known.
     bool audioCtxAuto = false;
+    rnwhisper::cpu_params cpu;
     JsiFunctionPtr onProgress;
     JsiFunctionPtr onNewSegments;
 
@@ -980,6 +981,19 @@ TranscribeConfig createTranscribeConfig(
     config.params.greedy.best_of =
         getIntProperty(runtime, options, "bestOf", config.params.greedy.best_of);
     config.nProcessors = std::max(1, getIntProperty(runtime, options, "nProcessors", 1));
+
+    // Same option names and mask syntax as llama.rn. Only parsed here: the
+    // threadpool is created by job_new on the job thread, which ggml pins too.
+    std::string cpuMask = getStringProperty(runtime, options, "cpu_mask");
+    if (!cpuMask.empty() && !rnwhisper::parse_cpu_mask(cpuMask, config.cpu.mask)) {
+        throw jsi::JSError(runtime, "Invalid cpu_mask: " + cpuMask);
+    }
+    config.cpu.strict = getBoolProperty(runtime, options, "cpu_strict", false);
+    if (config.cpu.has_mask() && config.nProcessors > 1) {
+        // Only the calling thread's chunk could use the pool; the other
+        // processors' threads would inherit its pinning instead.
+        throw jsi::JSError(runtime, "cpu_mask is not supported with nProcessors > 1");
+    }
     config.jobId = getIntProperty(
         runtime,
         options,
@@ -2153,7 +2167,7 @@ void installJSIBindings(
                     }
 
                     config.resolveAudioCtx(holder->context, static_cast<int64_t>(audio.size()));
-                    rnwhisper::job *job = rnwhisper::job_new(config.jobId, config.params);
+                    rnwhisper::job *job = rnwhisper::job_new(config.jobId, config.params, &config.cpu);
                     if (job == nullptr) {
                         throw JsiError("Failed to create transcription job");
                     }
@@ -2271,7 +2285,7 @@ void installJSIBindings(
                     }
 
                     config.resolveAudioCtx(holder->context, static_cast<int64_t>(audio.size()));
-                    rnwhisper::job *job = rnwhisper::job_new(config.jobId, config.params);
+                    rnwhisper::job *job = rnwhisper::job_new(config.jobId, config.params, &config.cpu);
                     if (job == nullptr) {
                         throw JsiError("Failed to create transcription job");
                     }

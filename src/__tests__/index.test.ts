@@ -86,6 +86,41 @@ test('passes Whisper audioCtx (number or auto) to file and data transcription', 
   await context.release()
 })
 
+test('passes cpu_mask and cpu_strict through to the native transcribe calls', async () => {
+  const { transcribeFile, transcribeData } = whisperMocks
+  const context = await initWhisper({ filePath: 'test.bin' })
+
+  await context.transcribe('file:///audio/jfk.wav', {
+    maxThreads: 2,
+    cpu_mask: '0xC0',
+    cpu_strict: true,
+  }).promise
+  expect(transcribeFile).toHaveBeenLastCalledWith(
+    context.id,
+    '/audio/jfk.wav',
+    expect.objectContaining({
+      maxThreads: 2,
+      cpu_mask: '0xC0',
+      cpu_strict: true,
+      jobId: expect.any(Number),
+    }),
+  )
+
+  const audioData = new Float32Array(16).buffer
+  await context.transcribeData(audioData, { cpu_mask: '6-7' }).promise
+  const [, options] = transcribeData.mock.calls.at(-1)!
+  expect(options).toMatchObject({ cpu_mask: '6-7' })
+  expect(options).not.toHaveProperty('cpu_strict')
+
+  // Without the options nothing is added, so the native default path is kept
+  await context.transcribe('file:///audio/jfk.wav').promise
+  const [, , defaultOptions] = transcribeFile.mock.calls.at(-1)!
+  expect(defaultOptions).not.toHaveProperty('cpu_mask')
+  expect(defaultOptions).not.toHaveProperty('cpu_strict')
+
+  await context.release()
+})
+
 test('initializes and releases a Parakeet context', async () => {
   expect(parakeetContextIsRealtimeCompatible).toBe(true)
 

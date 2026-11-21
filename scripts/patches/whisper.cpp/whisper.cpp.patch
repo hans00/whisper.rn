@@ -28,13 +28,6 @@ Hexagon (ggml-hexagon) support, needed until the equivalent lands upstream:
   whisper_free_state when a backend, KV cache or compute buffer cannot be
   allocated, which runs before whisper_batch_init and used to free the
   uninitialized batch pointers (scudo abort on Android).
-
-CPU threadpool (whisper_full_params.threadpool, see whisper.h.patch):
-whisper_full_with_state attaches the caller's pool to the state's CPU backend
-for the call and detaches it on every return path, since the backends outlive
-the call and the caller frees the pool afterwards. ggml_backend_set_n_threads still
-sets the per-graph thread count. whisper_full_parallel keeps the pool for the
-calling thread's chunk only, because one pool cannot run two graphs at once.
 --- a/src/whisper.cpp
 +++ b/src/whisper.cpp
 @@ -868,7 +868,7 @@
@@ -46,7 +39,17 @@ calling thread's chunk only, because one pool cannot run two graphs at once.
  
      whisper_decoder decoders[WHISPER_MAX_DECODERS];
  
-@@ -1418,10 +1418,8 @@
+@@ -932,6 +932,9 @@
+     // [EXPERIMENTAL] speed-up techniques
+     int32_t exp_n_audio_ctx = 0; // 0 - use default
+ 
++    // audio context of the last encode, 0 - none yet (see whisper_encode_internal)
++    int32_t last_n_audio_ctx = 0;
++
+     whisper_vad_context * vad_context = nullptr;
+ 
+     struct vad_segment_info {
+@@ -1418,10 +1421,8 @@
  static bool weight_buft_supported(const whisper_hparams & hparams, ggml_tensor * w, ggml_op op, ggml_backend_buffer_type_t buft, ggml_backend_dev_t dev) {
      bool op_supported = true;
  
@@ -59,7 +62,7 @@ calling thread's chunk only, because one pool cannot run two graphs at once.
          op_supported = true;
      } else {
          switch (op) {
-@@ -1461,7 +1459,9 @@
+@@ -1461,7 +1462,9 @@
                  break;
              }
              default: {
@@ -70,7 +73,7 @@ calling thread's chunk only, because one pool cannot run two graphs at once.
                  break;
              }
          };
-@@ -1862,12 +1862,15 @@
+@@ -1862,12 +1865,15 @@
          ggml_backend_buffer_type_t buft = p.first;
          ggml_context * ctx = p.second;
          ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
@@ -91,7 +94,7 @@ calling thread's chunk only, because one pool cannot run two graphs at once.
      }
  
      // load weights
-@@ -1968,10 +1971,6 @@
+@@ -1968,10 +1974,6 @@
          }
      }
  
@@ -102,7 +105,7 @@ calling thread's chunk only, because one pool cannot run two graphs at once.
      wctx.t_load_us = ggml_time_us() - t_start_us;
  
      return true;
-@@ -2104,6 +2103,14 @@
+@@ -2104,6 +2106,14 @@
  
      struct ggml_context * ctx0 = ggml_init(params);
  
@@ -117,7 +120,7 @@ calling thread's chunk only, because one pool cannot run two graphs at once.
      ggml_cgraph * gf = ggml_new_graph_custom(ctx0, WHISPER_MAX_NODES, false);
  
      struct ggml_tensor * cur = ggml_view_tensor(ctx0, wstate.embd_conv);
-@@ -2181,8 +2188,12 @@
+@@ -2181,8 +2191,12 @@
                          0, 2, 1, 3);
  
              if (wctx.params.flash_attn) {
@@ -132,7 +135,7 @@ calling thread's chunk only, because one pool cannot run two graphs at once.
  
                  struct ggml_tensor * K =
                      ggml_view_3d(ctx0, kv_pad.k,
-@@ -2333,6 +2344,14 @@
+@@ -2333,6 +2347,14 @@
  
      struct ggml_context * ctx0 = ggml_init(params);
  
@@ -147,7 +150,7 @@ calling thread's chunk only, because one pool cannot run two graphs at once.
      ggml_cgraph * gf = ggml_new_graph(ctx0);
  
      struct ggml_tensor * cur = ggml_view_tensor(ctx0, wstate.embd_enc);
-@@ -2362,10 +2381,12 @@
+@@ -2362,10 +2384,12 @@
          struct ggml_tensor * v;
  
          if (wctx.params.flash_attn) {
@@ -162,7 +165,7 @@ calling thread's chunk only, because one pool cannot run two graphs at once.
                      (ggml_element_size(wstate.kv_cross.v)*n_state)*(il*n_ctx_pad));
          } else {
              Vcross = ggml_transpose(ctx0, ggml_reshape_2d(ctx0, Vcross, n_state, n_ctx));
-@@ -2378,8 +2399,13 @@
+@@ -2378,8 +2402,13 @@
                      (il*n_ctx)*ggml_element_size(wstate.kv_cross.v)*n_state);
          }
  
@@ -178,7 +181,29 @@ calling thread's chunk only, because one pool cannot run two graphs at once.
      }
  
      //ggml_graph_print(gf);
-@@ -2491,6 +2517,13 @@
+@@ -2408,6 +2437,21 @@
+                    void * abort_callback_data) {
+     const int64_t t_start_us = ggml_time_us();
+ 
++    // The flash-attn encoder and cross-attention read GGML_PAD(n_ctx, 256) rows of kv_pad / kv_cross
++    // without a mask, but only the first n_ctx rows are written. When the audio context changes
++    // between encodes, rows left over from the previous one would leak into the attention, so
++    // restore the zero padding of a fresh state.
++    {
++        const int n_ctx = wstate.exp_n_audio_ctx > 0 ? wstate.exp_n_audio_ctx : wctx.model.hparams.n_audio_ctx;
++
++        if (wctx.params.flash_attn && wstate.last_n_audio_ctx != 0 && wstate.last_n_audio_ctx != n_ctx) {
++            ggml_backend_buffer_clear(wstate.kv_pad.buffer, 0);
++            ggml_backend_buffer_clear(wstate.kv_cross.buffer, 0);
++        }
++
++        wstate.last_n_audio_ctx = n_ctx;
++    }
++
+     // conv
+     {
+         auto & sched = wstate.sched_conv.sched;
+@@ -2491,6 +2535,13 @@
              return false;
          }
  
@@ -192,7 +217,7 @@ calling thread's chunk only, because one pool cannot run two graphs at once.
          if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
              return false;
          }
-@@ -2507,6 +2540,13 @@
+@@ -2507,6 +2558,13 @@
              return false;
          }
  
@@ -206,7 +231,7 @@ calling thread's chunk only, because one pool cannot run two graphs at once.
          if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
              return false;
          }
-@@ -2566,6 +2606,14 @@
+@@ -2566,6 +2624,14 @@
      ggml_set_name(position, "position");
      ggml_set_input(position);
  
@@ -221,7 +246,7 @@ calling thread's chunk only, because one pool cannot run two graphs at once.
      const float KQscale = pow(float(n_state_head), -0.25);
  
      struct ggml_tensor * KQ_mask = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_kv, n_tokens, 1);
-@@ -2633,11 +2681,13 @@
+@@ -2633,11 +2699,13 @@
                  struct ggml_tensor * v;
  
                  if (wctx.params.flash_attn) {
@@ -239,7 +264,7 @@ calling thread's chunk only, because one pool cannot run two graphs at once.
                  } else {
                      Vcur = ggml_transpose(ctx0, ggml_reshape_2d(ctx0, Vcur, n_state, n_tokens));
  
-@@ -2649,8 +2699,13 @@
+@@ -2649,8 +2717,13 @@
                              (il*n_ctx)*ggml_element_size(kv_self.v)*n_state + kv_head*ggml_element_size(kv_self.v));
                  }
  
@@ -255,7 +280,7 @@ calling thread's chunk only, because one pool cannot run two graphs at once.
              }
  
              // ------
-@@ -2961,6 +3016,13 @@
+@@ -2961,6 +3034,13 @@
          }
  
          {
@@ -269,7 +294,7 @@ calling thread's chunk only, because one pool cannot run two graphs at once.
              struct ggml_tensor * position = ggml_graph_get_tensor(gf, "position");
              for (int i = 0; i < n_tokens; ++i) {
                  const int32_t val = batch.pos[i];
-@@ -3514,10 +3576,12 @@
+@@ -3514,10 +3594,12 @@
              return nullptr;
          }
          const size_t memory_size = aheads_masks_nbytes(state->aheads_masks);
@@ -283,7 +308,7 @@ calling thread's chunk only, because one pool cannot run two graphs at once.
      const auto path_coreml = whisper_get_coreml_path_encoder(ctx->path_model);
  
      WHISPER_LOG_INFO("%s: loading Core ML model from '%s'\n", __func__, path_coreml.c_str());
-@@ -3533,6 +3597,7 @@
+@@ -3533,6 +3615,7 @@
      } else {
          WHISPER_LOG_INFO("%s: Core ML model loaded\n", __func__);
      }
@@ -291,7 +316,7 @@ calling thread's chunk only, because one pool cannot run two graphs at once.
  #endif
  
  #ifdef WHISPER_USE_VITISAI
-@@ -3713,6 +3778,7 @@
+@@ -3713,6 +3796,7 @@
  struct whisper_context_params whisper_context_default_params() {
      struct whisper_context_params result = {
          /*.use_gpu              =*/ true,
@@ -299,7 +324,7 @@ calling thread's chunk only, because one pool cannot run two graphs at once.
          /*.flash_attn           =*/ true,
          /*.gpu_device           =*/ 0,
  
-@@ -3846,7 +3912,8 @@
+@@ -3846,7 +3930,8 @@
      if (!model_loaded) {
          loader->close(loader->context);
          WHISPER_LOG_ERROR("%s: failed to load model\n", __func__);
@@ -309,7 +334,7 @@ calling thread's chunk only, because one pool cannot run two graphs at once.
          return nullptr;
      }
  
-@@ -4618,10 +4685,8 @@
+@@ -4618,10 +4703,8 @@
  static bool weight_buft_supported(const whisper_vad_hparams & hparams, ggml_tensor * w, ggml_op op, ggml_backend_buffer_type_t buft, ggml_backend_dev_t dev) {
      bool op_supported = true;
  
@@ -322,7 +347,7 @@ calling thread's chunk only, because one pool cannot run two graphs at once.
          op_supported = true;
      } else {
          switch (op) {
-@@ -4654,7 +4719,9 @@
+@@ -4654,7 +4737,9 @@
                  break;
              }
              default: {
@@ -333,7 +358,7 @@ calling thread's chunk only, because one pool cannot run two graphs at once.
                  break;
              }
          };
-@@ -5144,12 +5211,16 @@
+@@ -5144,12 +5229,16 @@
          ggml_backend_buffer_type_t buft = p.first;
          ggml_context * ctx = p.second;
          ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
@@ -355,7 +380,7 @@ calling thread's chunk only, because one pool cannot run two graphs at once.
      }
  
      // load weights
-@@ -6172,6 +6243,8 @@
+@@ -6172,6 +6261,8 @@
          /*.vad_model_path              =*/ nullptr,
  
          /* vad_params =*/ whisper_vad_default_params(),
@@ -364,7 +389,7 @@ calling thread's chunk only, because one pool cannot run two graphs at once.
      };
  
      switch (strategy) {
-@@ -6970,12 +7043,48 @@
+@@ -6970,12 +7061,48 @@
      return true;
  }
  
@@ -413,7 +438,23 @@ calling thread's chunk only, because one pool cannot run two graphs at once.
      // clear old results
      auto & result_all = state->result_all;
  
-@@ -8021,6 +8130,9 @@
+@@ -7145,6 +7272,15 @@
+     }
+     state->exp_n_audio_ctx = params.audio_ctx;
+ 
++#ifdef WHISPER_USE_COREML
++    // the Core ML encoder takes a fixed 1x80x3000 mel input, a shorter audio context cannot be fed to it
++    if (state->ctx_coreml != nullptr && state->exp_n_audio_ctx > 0 && state->exp_n_audio_ctx < whisper_n_audio_ctx(ctx)) {
++        WHISPER_LOG_WARN("%s: audio_ctx = %d is not supported by the Core ML encoder, using the full context (%d)\n",
++                __func__, state->exp_n_audio_ctx, whisper_n_audio_ctx(ctx));
++        state->exp_n_audio_ctx = 0;
++    }
++#endif
++
+     // these tokens determine the task that will be performed
+     std::vector<whisper_token> prompt_init = { whisper_token_sot(ctx), };
+ 
+@@ -8021,6 +8157,9 @@
          params_cur.progress_callback = nullptr;
          params_cur.progress_callback_user_data = nullptr;
  
@@ -423,7 +464,7 @@ calling thread's chunk only, because one pool cannot run two graphs at once.
          workers[i] = std::thread(whisper_full_with_state, ctx, states[i], std::move(params_cur), samples + start_samples, n_samples_cur);
      }
  
-@@ -9358,7 +9470,9 @@
+@@ -9358,7 +9497,9 @@
      (void) level;
      (void) user_data;
  #ifndef WHISPER_DEBUG
